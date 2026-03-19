@@ -465,9 +465,10 @@ function M.get_suggestion(suggestion_id, callback, intent)
 			})
 		end
 
-		-- TODO: additional_files is disabled — sending them causes the Cursor API
-		-- to return not_found errors and poison the session. Needs investigation
-		-- into the exact proto format the API expects.
+		-- additional_files disabled: the Cursor API v4 rejects StreamCpp requests
+		-- that include this field (even with correct relative paths and minimal data),
+		-- returning not_found errors that poison the entire session. The proto defines
+		-- the field but the API backend doesn't support it for tab completions.
 		local additional_files = {}
 
 		-- Line ending detection

@@ -216,16 +216,10 @@ func handleNewSuggestion(w http.ResponseWriter, r *http.Request) {
 	if len(req.AdditionalFiles) > 0 {
 		logger.Info("Including additional files", "count", len(req.AdditionalFiles))
 		for _, af := range req.AdditionalFiles {
+			logger.Debug("Additional file", "path", af.RelativeWorkspacePath, "is_open", af.IsOpen)
 			protoFile := &aiserverv1.AdditionalFile{
 				RelativeWorkspacePath: af.RelativeWorkspacePath,
 				IsOpen:                af.IsOpen,
-				VisibleRangeContent:   af.VisibleRangeContent,
-			}
-			if af.LastViewedAt > 0 {
-				protoFile.LastViewedAt = &af.LastViewedAt
-			}
-			if af.StartLineNumberOneIndexed > 0 {
-				protoFile.StartLineNumberOneIndexed = []int32{af.StartLineNumberOneIndexed}
 			}
 			streamReq.AdditionalFiles = append(streamReq.AdditionalFiles, protoFile)
 		}
