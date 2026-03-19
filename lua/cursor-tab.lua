@@ -171,6 +171,7 @@ function M.setup(opts)
 
 	vim.api.nvim_create_autocmd({ "TextChangedI" }, {
 		callback = function()
+			if vim.bo.buftype ~= "" then return end
 			if not M.is_nes_active then
 				M.show_suggestion()
 			end
@@ -180,6 +181,7 @@ function M.setup(opts)
 	-- Trigger suggestions on normal mode edits (dd, p, x, etc.)
 	vim.api.nvim_create_autocmd({ "TextChanged" }, {
 		callback = function()
+			if vim.bo.buftype ~= "" then return end
 			if not M.is_nes_active and not M.accepting then
 				M.show_suggestion()
 			end
@@ -463,33 +465,10 @@ function M.get_suggestion(suggestion_id, callback, intent)
 			})
 		end
 
-		-- Collect additional files: other open listed buffers with their paths
+		-- TODO: additional_files is disabled — sending them causes the Cursor API
+		-- to return not_found errors and poison the session. Needs investigation
+		-- into the exact proto format the API expects.
 		local additional_files = {}
-		local current_file = vim.fn.expand("%:p")
-		for _, b in ipairs(vim.api.nvim_list_bufs()) do
-			if vim.api.nvim_buf_is_loaded(b) and vim.bo[b].buflisted and b ~= bufnr then
-				local bname = vim.api.nvim_buf_get_name(b)
-				if bname ~= "" and bname ~= current_file then
-					local entry = {
-						relative_workspace_path = bname,
-						is_open = true,
-						last_viewed_at = M.buf_last_viewed[b] or 0,
-					}
-					-- Get visible range content for buffers currently in a window
-					for _, win in ipairs(vim.api.nvim_list_wins()) do
-						if vim.api.nvim_win_get_buf(win) == b then
-							local top = vim.fn.line("w0", win)
-							local bot = vim.fn.line("w$", win)
-							local visible_lines = vim.api.nvim_buf_get_lines(b, top - 1, bot, false)
-							entry.visible_range_content = visible_lines
-							entry.start_line_number_one_indexed = top
-							break
-						end
-					end
-					table.insert(additional_files, entry)
-				end
-			end
-		end
 
 		-- Line ending detection
 		local line_ending = vim.bo.fileformat == "dos" and "\r\n" or "\n"
@@ -621,6 +600,20 @@ end
 function M.show_suggestion(suggestion_id, intent)
 	if not M.enabled or (M.accepting and not suggestion_id) then
 		return
+	end
+
+	-- Skip non-file buffers (Telescope, oil, terminal, etc.)
+	-- Sending requests for these poisons the Cursor API session.
+	if not suggestion_id then
+		local buftype = vim.bo.buftype
+		if buftype ~= "" then return end
+		local ft = vim.bo.filetype
+		if ft == "" or ft == "TelescopePrompt" or ft == "oil" or ft == "terminal"
+			or ft == "qf" or ft == "help" or ft == "nofile" then
+			return
+		end
+		local bufname = vim.api.nvim_buf_get_name(0)
+		if bufname == "" or bufname:match("^%w+://") then return end
 	end
 
 	if M.debounce_timer then
