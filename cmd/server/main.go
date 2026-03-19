@@ -28,6 +28,12 @@ var logger *slog.Logger
 var activeStreamMu sync.Mutex
 var activeStreamCancel context.CancelFunc
 
+// Per-file diff history: tracks diffs from accepted suggestions (not user edits).
+// Format: "5-|old line\n5+|new line\n" — matches Cursor IDE reference implementation.
+// Sliding window of max 3 entries per file.
+var diffHistoryMu sync.Mutex
+var diffHistoryMap = make(map[string][]string) // fileName -> []diffString
+
 type NewSuggestionRequest struct {
 	FileContents  string `json:"file_contents"`
 	Line          int32  `json:"line"`
@@ -36,6 +42,15 @@ type NewSuggestionRequest struct {
 	LanguageID    string `json:"language_id"`
 	WorkspacePath string `json:"workspace_path"`
 	Intent        string `json:"intent,omitempty"`
+}
+
+// RecordDiffRequest is sent by the Lua plugin after accepting a suggestion.
+// It records the diff between old and new text for file_diff_histories.
+type RecordDiffRequest struct {
+	FilePath  string   `json:"file_path"`
+	StartLine int      `json:"start_line"` // 0-indexed
+	OldLines  []string `json:"old_lines"`
+	NewLines  []string `json:"new_lines"`
 }
 
 type SuggestionResponse struct {
@@ -98,6 +113,19 @@ func handleNewSuggestion(w http.ResponseWriter, r *http.Request) {
 	lines := strings.Split(req.FileContents, "\n")
 	totalLines := int32(len(lines))
 
+	// Look up diff history for this file
+	diffHistoryMu.Lock()
+	diffHistory := diffHistoryMap[req.FilePath]
+	// Make a copy to avoid holding the lock
+	diffHistoryCopy := make([]string, len(diffHistory))
+	copy(diffHistoryCopy, diffHistory)
+	diffHistoryMu.Unlock()
+
+	logger.Info("Including diff history", "file", req.FilePath, "entries", len(diffHistoryCopy))
+	for i, d := range diffHistoryCopy {
+		logger.Debug("Diff history entry", "index", i, "diff", d)
+	}
+
 	giveDebug := true
 	supportsCpt := true
 	supportsCrlfCpt := true
@@ -118,6 +146,12 @@ func handleNewSuggestion(w http.ResponseWriter, r *http.Request) {
 		},
 		CppIntentInfo: &aiserverv1.CppIntentInfo{
 			Source: intentSource,
+		},
+		FileDiffHistories: []*aiserverv1.CppFileDiffHistory{
+			{
+				FileName:    req.FilePath,
+				DiffHistory: diffHistoryCopy,
+			},
 		},
 		IsDebug:         &isDebug,
 		SupportsCpt:     &supportsCpt,
@@ -524,6 +558,84 @@ func handleGetSuggestion(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// handleRecordDiff records the diff from an accepted suggestion into per-file history.
+// This is called by the Lua plugin after Tab-accepting a suggestion.
+// Format matches Cursor IDE reference: "5-|old line\n5+|new line\n"
+func handleRecordDiff(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req RecordDiffRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Error("Error decoding record_diff request", "error", err)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Build diff string in the reference format: "lineNum-|old\nlineNum+|new\n"
+	var diffStr string
+	maxLen := len(req.OldLines)
+	if len(req.NewLines) > maxLen {
+		maxLen = len(req.NewLines)
+	}
+
+	for i := 0; i < maxLen; i++ {
+		lineNum := req.StartLine + i + 1 // 1-indexed for the diff format
+
+		var oldLine *string
+		var newLine *string
+		if i < len(req.OldLines) {
+			oldLine = &req.OldLines[i]
+		}
+		if i < len(req.NewLines) {
+			newLine = &req.NewLines[i]
+		}
+
+		if oldLine != nil && newLine != nil && *oldLine == *newLine {
+			continue // identical lines, skip
+		}
+
+		if oldLine != nil && newLine != nil {
+			// Modified line
+			diffStr += fmt.Sprintf("%d-|%s\n%d+|%s\n", lineNum, *oldLine, lineNum, *newLine)
+		} else if newLine != nil {
+			// Added line
+			diffStr += fmt.Sprintf("%d+|%s\n", lineNum, *newLine)
+		} else if oldLine != nil {
+			// Removed line
+			diffStr += fmt.Sprintf("%d-|%s\n", lineNum, *oldLine)
+		}
+	}
+
+	if diffStr == "" {
+		logger.Debug("record_diff: no actual diff to record", "file", req.FilePath)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "no_diff"})
+		return
+	}
+
+	// Append to per-file history, sliding window of 3
+	diffHistoryMu.Lock()
+	history := diffHistoryMap[req.FilePath]
+	history = append(history, diffStr)
+	if len(history) > 3 {
+		history = history[len(history)-3:]
+	}
+	diffHistoryMap[req.FilePath] = history
+	diffHistoryMu.Unlock()
+
+	logger.Info("Recorded diff for file",
+		"file", req.FilePath,
+		"diff", diffStr,
+		"total_entries", len(history),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
 func main() {
 	// Parse command-line flags
 	port := flag.Int("port", 0, "Port to listen on (0 = OS assigns available port)")
@@ -552,6 +664,9 @@ func main() {
 
 	// GET /suggestion/{id} - retrieve existing suggestion from store
 	http.HandleFunc("/suggestion/", handleGetSuggestion)
+
+	// POST /diff/record - record diff from accepted suggestion
+	http.HandleFunc("/diff/record", handleRecordDiff)
 
 	// Create listener to get actual port
 	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", *port))
