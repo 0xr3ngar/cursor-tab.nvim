@@ -4,6 +4,8 @@ Brings Cursor's AI-powered tab completion (NES / Next Edit Suggestion) to Neovim
 
 > **Experimental** — Under active development. Contributions welcome.
 
+https://github.com/user-attachments/assets/ea7c5f90-11cc-4e17-82d5-1cbfcf85a463
+
 ## Features
 
 - **Inline tab completion** — Ghost text suggestions as you type, accept with Tab
