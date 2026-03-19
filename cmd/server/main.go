@@ -34,14 +34,27 @@ var activeStreamCancel context.CancelFunc
 var diffHistoryMu sync.Mutex
 var diffHistoryMap = make(map[string][]string) // fileName -> []diffString
 
+// DiagnosticInfo represents a single LSP diagnostic from Neovim.
+// Sent by the Lua plugin from vim.diagnostic.get() results.
+type DiagnosticInfo struct {
+	Message   string `json:"message"`
+	Severity  int32  `json:"severity"`   // 1=Error, 2=Warning, 3=Info, 4=Hint
+	StartLine int32  `json:"start_line"` // 0-indexed
+	StartCol  int32  `json:"start_col"`  // 0-indexed
+	EndLine   int32  `json:"end_line"`   // 0-indexed
+	EndCol    int32  `json:"end_col"`    // 0-indexed
+	Source    string `json:"source"`     // e.g. "pyright", "eslint", "lua_ls"
+}
+
 type NewSuggestionRequest struct {
-	FileContents  string `json:"file_contents"`
-	Line          int32  `json:"line"`
-	Column        int32  `json:"column"`
-	FilePath      string `json:"file_path"`
-	LanguageID    string `json:"language_id"`
-	WorkspacePath string `json:"workspace_path"`
-	Intent        string `json:"intent,omitempty"`
+	FileContents  string           `json:"file_contents"`
+	Line          int32            `json:"line"`
+	Column        int32            `json:"column"`
+	FilePath      string           `json:"file_path"`
+	LanguageID    string           `json:"language_id"`
+	WorkspacePath string           `json:"workspace_path"`
+	Intent        string           `json:"intent,omitempty"`
+	Diagnostics   []DiagnosticInfo `json:"diagnostics,omitempty"`
 }
 
 // RecordDiffRequest is sent by the Lua plugin after accepting a suggestion.
@@ -157,6 +170,61 @@ func handleNewSuggestion(w http.ResponseWriter, r *http.Request) {
 		SupportsCpt:     &supportsCpt,
 		SupportsCrlfCpt: &supportsCrlfCpt,
 		GiveDebugOutput: &giveDebug,
+	}
+
+	// Populate diagnostics from Neovim LSP into both proto fields:
+	// 1. CurrentFileInfo.Diagnostics (inline per-file diagnostics)
+	// 2. StreamCppRequest.LinterErrors (top-level with file contents and source)
+	if len(req.Diagnostics) > 0 {
+		logger.Info("Including LSP diagnostics", "count", len(req.Diagnostics))
+
+		var protoDiagnostics []*aiserverv1.Diagnostic
+		var linterErrors []*aiserverv1.LinterError
+
+		for _, d := range req.Diagnostics {
+			diagRange := &aiserverv1.CursorRange{
+				StartPosition: &aiserverv1.CursorPosition{
+					Line:   d.StartLine,
+					Column: d.StartCol,
+				},
+				EndPosition: &aiserverv1.CursorPosition{
+					Line:   d.EndLine,
+					Column: d.EndCol,
+				},
+			}
+
+			// Map severity: vim.diagnostic and proto use the same values (1-4)
+			severity := aiserverv1.DiagnosticSeverity(d.Severity)
+
+			// CurrentFileInfo.Diagnostics entry
+			protoDiagnostics = append(protoDiagnostics, &aiserverv1.Diagnostic{
+				Message:  d.Message,
+				Range:    diagRange,
+				Severity: severity,
+			})
+
+			// LinterErrors entry (includes source and is_stale)
+			linterErrors = append(linterErrors, &aiserverv1.LinterError{
+				Message:  d.Message,
+				Range:    diagRange,
+				Source:   &d.Source,
+				Severity: &severity,
+			})
+
+			logger.Debug("Diagnostic",
+				"message", d.Message,
+				"severity", d.Severity,
+				"source", d.Source,
+				"range", fmt.Sprintf("%d:%d-%d:%d", d.StartLine, d.StartCol, d.EndLine, d.EndCol),
+			)
+		}
+
+		streamReq.CurrentFile.Diagnostics = protoDiagnostics
+		streamReq.LinterErrors = &aiserverv1.LinterErrors{
+			RelativeWorkspacePath: req.FilePath,
+			Errors:                linterErrors,
+			FileContents:          req.FileContents,
+		}
 	}
 
 	// Cancel any previous in-flight stream immediately (don't block waiting for it)

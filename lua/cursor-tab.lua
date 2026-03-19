@@ -346,6 +346,25 @@ function M.get_suggestion(suggestion_id, callback, intent)
 		local col = cursor[2]
 		local workspace_path = vim.fn.getcwd()
 
+		-- Collect LSP diagnostics for current buffer
+		local diagnostics = {}
+		local raw_diagnostics = vim.diagnostic.get(bufnr)
+		for _, d in ipairs(raw_diagnostics) do
+			-- Map vim.diagnostic.severity to proto DiagnosticSeverity values:
+			-- vim: ERROR=1, WARN=2, INFO=3, HINT=4
+			-- proto: ERROR=1, WARNING=2, INFORMATION=3, HINT=4 (same mapping)
+			local severity = d.severity or 1
+			table.insert(diagnostics, {
+				message = d.message or "",
+				severity = severity,
+				start_line = d.lnum or 0,       -- 0-indexed
+				start_col = d.col or 0,          -- 0-indexed
+				end_line = d.end_lnum or d.lnum or 0,
+				end_col = d.end_col or d.col or 0,
+				source = d.source or "",
+			})
+		end
+
 		local req = {
 			file_contents = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n"),
 			line = line,
@@ -354,6 +373,7 @@ function M.get_suggestion(suggestion_id, callback, intent)
 			language_id = vim.bo.filetype,
 			workspace_path = workspace_path,
 			intent = intent or "typing",
+			diagnostics = diagnostics,
 		}
 
 		local json_data = vim.fn.json_encode(req)
