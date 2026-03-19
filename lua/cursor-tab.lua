@@ -323,6 +323,55 @@ function M.get_suggestion(suggestion_id, callback)
 	end
 end
 
+-- Shared NES diff display: red old lines above, green new lines above original, dim original
+function M.display_nes_diff(bufnr, start_line, end_line, new_text_lines)
+	local line_count = vim.api.nvim_buf_line_count(bufnr)
+	local display_line = start_line
+
+	-- Get original text that will be replaced
+	local original_lines = {}
+	if start_line <= end_line and start_line < line_count then
+		local actual_end = math.min(end_line + 1, line_count)
+		original_lines = vim.api.nvim_buf_get_lines(bufnr, start_line, actual_end, false)
+	end
+
+	-- Build combined virt_lines: red old + green new, shown ABOVE the target line
+	local virt_above = {}
+
+	-- Red old text (strikethrough)
+	for _, old_text in ipairs(original_lines) do
+		table.insert(virt_above, { { "  " .. old_text, "CursorTabOldText" } })
+	end
+
+	-- Green new text
+	for _, new_text in ipairs(new_text_lines) do
+		table.insert(virt_above, { { "  " .. new_text, "CursorTabNES" } })
+	end
+
+	if #virt_above > 0 then
+		vim.api.nvim_buf_set_extmark(bufnr, M.ns_id, display_line, 0, {
+			virt_lines = virt_above,
+			virt_lines_above = true,
+		})
+	end
+
+	-- Dim/hide original lines in the replacement range
+	for l = start_line, math.min(end_line, line_count - 1) do
+		vim.api.nvim_buf_set_extmark(bufnr, M.ns_id, l, 0, {
+			line_hl_group = "CursorTabOldLine",
+		})
+	end
+
+	-- Tab marker on first target line
+	vim.api.nvim_buf_set_extmark(bufnr, M.ns_id, display_line, 0, {
+		virt_text = { { " Tab ", "CursorTabJumpMarker" } },
+		virt_text_pos = "right_align",
+		hl_mode = "combine",
+	})
+
+	return display_line
+end
+
 function M.show_suggestion(suggestion_id)
 	-- Allow showing chained suggestions even while accepting
 	if not M.enabled or (M.accepting and not suggestion_id) then
@@ -603,7 +652,10 @@ function M.clear_suggestion()
 		M.current_suggestion_text = nil
 		M.current_line = nil
 		M.current_col = nil
-		M.next_suggestion_id = nil
+M.next_suggestion_id = nil
+M.jump_marker = nil
+M.is_nes_active = false
+M.last_cursor_line = nil
 	end
 end
 
