@@ -488,6 +488,9 @@ function M.show_suggestion(suggestion_id, intent)
 
 			-- Done showing next suggestion, allow new suggestions
 			M.accepting = false
+
+			-- Set up autocmd to clear NES if user moves away or types
+			M.setup_nes_clear_autocmd()
 		end)
 		return
 	end
@@ -611,6 +614,7 @@ function M.show_suggestion(suggestion_id, intent)
 					M.log("NES debounce: moved cursor to target line " .. display_line)
 				end
 
+				M.setup_nes_clear_autocmd()
 				return
 			end
 
@@ -729,7 +733,54 @@ function M.clear_suggestion()
 		M.current_col = nil
 		M.next_suggestion_id = nil
 		M.is_nes_active = false
+		-- Remove NES clear autocmd if it exists
+		if M.nes_clear_augroup then
+			pcall(vim.api.nvim_del_augroup_by_id, M.nes_clear_augroup)
+			M.nes_clear_augroup = nil
+		end
 	end
+end
+
+-- Set up autocmds to clear NES display when user starts typing or makes other edits
+function M.setup_nes_clear_autocmd()
+	-- Remove any existing group first
+	if M.nes_clear_augroup then
+		pcall(vim.api.nvim_del_augroup_by_id, M.nes_clear_augroup)
+	end
+
+	-- Defer setup to skip the initial cursor positioning events
+	vim.defer_fn(function()
+		-- NES might have been cleared or accepted already
+		if not M.is_nes_active then
+			return
+		end
+
+		M.nes_clear_augroup = vim.api.nvim_create_augroup("CursorTabNESClear", { clear = true })
+
+		-- Clear NES if user starts typing (not Tab)
+		vim.api.nvim_create_autocmd({ "InsertCharPre" }, {
+			group = M.nes_clear_augroup,
+			callback = function()
+				if M.is_nes_active and not M.accepting then
+					M.log("NES cleared: user started typing")
+					M.clear_suggestion()
+				end
+			end,
+			once = true,
+		})
+
+		-- Clear NES if user makes a different edit in normal mode (dd, x, p, etc.)
+		vim.api.nvim_create_autocmd({ "TextChanged" }, {
+			group = M.nes_clear_augroup,
+			callback = function()
+				if M.is_nes_active and not M.accepting then
+					M.log("NES cleared: text changed (user edit)")
+					M.clear_suggestion()
+				end
+			end,
+			once = true,
+		})
+	end, 50)
 end
 
 function M.accept_suggestion()
@@ -842,8 +893,15 @@ function M.accept_suggestion()
 				M.show_suggestion(next_suggestion_id)
 			end, 10)
 		else
-			M.log("No next suggestion, done with chain")
+			M.log("No next suggestion, requesting more from API")
 			M.accepting = false
+			-- Auto-request new suggestions to extend the chain seamlessly
+			-- Use "cursor_prediction" intent since we just accepted a suggestion
+			vim.defer_fn(function()
+				if not M.is_nes_active and not M.accepting then
+					M.show_suggestion(nil, "cursor_prediction")
+				end
+			end, 50)
 		end
 	end)
 
