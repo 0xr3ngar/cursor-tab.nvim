@@ -19,6 +19,8 @@ M.next_suggestion_id = nil
 M.jump_marker = nil
 M.is_nes_active = false
 M.last_cursor_line = nil
+M.file_versions = {} -- per-buffer monotonic version counter (bufnr -> int)
+M.buf_last_viewed = {} -- per-buffer last viewed timestamp (bufnr -> epoch float)
 
 -- Simple logging function
 function M.log(msg)
@@ -123,6 +125,22 @@ function M.setup(opts)
 				vim.fn.jobstop(M.server_job)
 				M.server_job = nil
 			end
+		end,
+	})
+
+	-- Track file version (monotonic counter per buffer, incremented on every text change)
+	vim.api.nvim_create_autocmd({ "TextChangedI", "TextChanged" }, {
+		callback = function()
+			local bufnr = vim.api.nvim_get_current_buf()
+			M.file_versions[bufnr] = (M.file_versions[bufnr] or 0) + 1
+		end,
+	})
+
+	-- Track buffer last-viewed timestamps for additional_files
+	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
+		callback = function()
+			local bufnr = vim.api.nvim_get_current_buf()
+			M.buf_last_viewed[bufnr] = vim.loop.now() / 1000.0 -- epoch seconds as float
 		end,
 	})
 
@@ -365,6 +383,40 @@ function M.get_suggestion(suggestion_id, callback, intent)
 			})
 		end
 
+		-- Collect additional files: other open listed buffers with their paths
+		local additional_files = {}
+		local current_file = vim.fn.expand("%:p")
+		for _, b in ipairs(vim.api.nvim_list_bufs()) do
+			if vim.api.nvim_buf_is_loaded(b) and vim.bo[b].buflisted and b ~= bufnr then
+				local bname = vim.api.nvim_buf_get_name(b)
+				if bname ~= "" and bname ~= current_file then
+					local entry = {
+						relative_workspace_path = bname,
+						is_open = true,
+						last_viewed_at = M.buf_last_viewed[b] or 0,
+					}
+					-- Get visible range content for buffers currently in a window
+					for _, win in ipairs(vim.api.nvim_list_wins()) do
+						if vim.api.nvim_win_get_buf(win) == b then
+							local top = vim.fn.line("w0", win)
+							local bot = vim.fn.line("w$", win)
+							local visible_lines = vim.api.nvim_buf_get_lines(b, top - 1, bot, false)
+							entry.visible_range_content = visible_lines
+							entry.start_line_number_one_indexed = top
+							break
+						end
+					end
+					table.insert(additional_files, entry)
+				end
+			end
+		end
+
+		-- Line ending detection
+		local line_ending = vim.bo.fileformat == "dos" and "\r\n" or "\n"
+
+		-- File version (monotonic counter)
+		local file_version = M.file_versions[bufnr] or 0
+
 		local req = {
 			file_contents = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n"),
 			line = line,
@@ -374,6 +426,10 @@ function M.get_suggestion(suggestion_id, callback, intent)
 			workspace_path = workspace_path,
 			intent = intent or "typing",
 			diagnostics = diagnostics,
+			additional_files = additional_files,
+			line_ending = line_ending,
+			file_version = file_version,
+			client_time = os.clock(), -- epoch-style timing
 		}
 
 		local json_data = vim.fn.json_encode(req)
