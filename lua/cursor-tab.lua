@@ -77,35 +77,43 @@ function M.setup(opts)
 		M.min_confidence = opts.min_confidence
 	end
 
-	-- Define highlights
-	vim.api.nvim_set_hl(0, "CursorTabJumpMarker", {
-		fg = "#000000",
-		bg = "#50fa7b",
-		bold = true,
-	})
-	vim.api.nvim_set_hl(0, "CursorTabNES", {
-		fg = "#e0ffe0",
-		bg = "#2d4a2d",
-		italic = true,
-	})
-	vim.api.nvim_set_hl(0, "CursorTabNESLine", {
-		bg = "#1a2e1a",
-	})
-	vim.api.nvim_set_hl(0, "CursorTabOldText", {
-		fg = "#ff6b6b",
-		bg = "#2a1a1a",
-		strikethrough = true,
-	})
-	vim.api.nvim_set_hl(0, "CursorTabOldLine", {
-		fg = "#4a4a4a",
-		bg = "#1a1a1a",
-		strikethrough = true,
-	})
-	vim.api.nvim_set_hl(0, "CursorTabGhost", {
-		fg = "#6a737d",
-		italic = true,
+	-- Define highlights (and re-apply after any colorscheme change)
+	local function set_highlights()
+		vim.api.nvim_set_hl(0, "CursorTabJumpMarker", {
+			fg = "#000000",
+			bg = "#50fa7b",
+			bold = true,
+		})
+		vim.api.nvim_set_hl(0, "CursorTabNES", {
+			fg = "#e0ffe0",
+			bg = "#2d4a2d",
+			italic = true,
+		})
+		vim.api.nvim_set_hl(0, "CursorTabNESLine", {
+			bg = "#1a2e1a",
+		})
+		vim.api.nvim_set_hl(0, "CursorTabOldText", {
+			fg = "#ff6b6b",
+			bg = "#2a1a1a",
+			strikethrough = true,
+		})
+		vim.api.nvim_set_hl(0, "CursorTabOldLine", {
+			fg = "#4a4a4a",
+			bg = "#1a1a1a",
+			strikethrough = true,
+		})
+		vim.api.nvim_set_hl(0, "CursorTabGhost", {
+			fg = "#6a737d",
+			italic = true,
+		})
+	end
+
+	set_highlights()
+	vim.api.nvim_create_autocmd("ColorScheme", {
+		callback = set_highlights,
 	})
 
+	local new_server_path
 	if not opts.server_path then
 		local installer = require("cursor-tab.installer")
 		local source = debug.getinfo(1, "S").source
@@ -117,10 +125,20 @@ function M.setup(opts)
 			return
 		end
 
-		M.server_path = installer.get_binary_path(plugin_dir)
+		new_server_path = installer.get_binary_path(plugin_dir)
 	else
-		M.server_path = opts.server_path
+		new_server_path = opts.server_path
 	end
+
+	-- If server_path changed (e.g. user config overrides auto-setup), kill the old server
+	if M.server_path ~= new_server_path and M.server_job then
+		vim.fn.jobstop(M.server_job)
+		M.server_job = nil
+		M.server_ready = false
+		M.server_port = nil
+		M.server_url = nil
+	end
+	M.server_path = new_server_path
 
 	M.ensure_server()
 
