@@ -18,6 +18,7 @@ type Suggestion struct {
 	BindingID              string     `json:"binding_id,omitempty"`
 	ShouldRemoveLeadingEol bool       `json:"should_remove_leading_eol,omitempty"`
 	NextSuggestionID       string     `json:"next_suggestion_id,omitempty"`
+	SuggestionConfidence   *int32     `json:"suggestion_confidence,omitempty"`
 	CreatedAt              time.Time  `json:"-"` // for TTL expiration
 }
 

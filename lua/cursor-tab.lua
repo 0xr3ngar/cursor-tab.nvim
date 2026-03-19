@@ -21,6 +21,7 @@ M.is_nes_active = false
 M.last_cursor_line = nil
 M.file_versions = {} -- per-buffer monotonic version counter (bufnr -> int)
 M.buf_last_viewed = {} -- per-buffer last viewed timestamp (bufnr -> epoch float)
+M.min_confidence = 0 -- minimum suggestion confidence to display (0-100, 0 = show all)
 
 -- Simple logging function
 function M.log(msg)
@@ -70,6 +71,11 @@ end
 
 function M.setup(opts)
 	opts = opts or {}
+
+	-- Confidence threshold: 0 = show all, 50 = default (50%), 100 = only highest confidence
+	if opts.min_confidence ~= nil then
+		M.min_confidence = opts.min_confidence
+	end
 
 	-- Define highlights
 	vim.api.nvim_set_hl(0, "CursorTabJumpMarker", {
@@ -296,6 +302,38 @@ function M.ensure_server()
 	return true
 end
 
+-- Collect LSP signature help (parameter hints) for the current cursor position.
+-- Returns a list of {label=string, documentation=string|nil} or empty table.
+function M.get_parameter_hints(bufnr, line, col)
+	local hints = {}
+	local clients = vim.lsp.get_clients({ bufnr = bufnr })
+	if #clients == 0 then
+		return hints
+	end
+
+	-- Only query clients that support signatureHelp
+	for _, client in ipairs(clients) do
+		if client.server_capabilities.signatureHelpProvider then
+			local params = vim.lsp.util.make_position_params(0, client.offset_encoding)
+			local result = client.request_sync("textDocument/signatureHelp", params, 200, bufnr)
+			if result and result.result and result.result.signatures then
+				for _, sig in ipairs(result.result.signatures) do
+					local hint = { label = sig.label }
+					if sig.documentation then
+						if type(sig.documentation) == "string" then
+							hint.documentation = sig.documentation
+						elseif type(sig.documentation) == "table" and sig.documentation.value then
+							hint.documentation = sig.documentation.value
+						end
+					end
+					table.insert(hints, hint)
+				end
+			end
+		end
+	end
+	return hints
+end
+
 function M.get_suggestion(suggestion_id, callback, intent)
 	if not M.ensure_server() then
 		if callback then
@@ -417,6 +455,9 @@ function M.get_suggestion(suggestion_id, callback, intent)
 		-- File version (monotonic counter)
 		local file_version = M.file_versions[bufnr] or 0
 
+		-- Collect LSP parameter/signature hints for function call context
+		local parameter_hints = M.get_parameter_hints(bufnr, line, col)
+
 		local req = {
 			file_contents = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n"),
 			line = line,
@@ -430,6 +471,7 @@ function M.get_suggestion(suggestion_id, callback, intent)
 			line_ending = line_ending,
 			file_version = file_version,
 			client_time = os.clock(), -- epoch-style timing
+			parameter_hints = parameter_hints,
 		}
 
 		local json_data = vim.fn.json_encode(req)
@@ -457,7 +499,14 @@ function M.get_suggestion(suggestion_id, callback, intent)
 
 				local ok, response = pcall(vim.fn.json_decode, response_text)
 				if ok and response and response.suggestion then
-					if callback then
+					-- Check confidence threshold: skip low-confidence suggestions
+					local confidence = response.suggestion_confidence
+					if confidence and M.min_confidence > 0 and confidence < M.min_confidence then
+						M.log("Skipping low-confidence suggestion: " .. confidence .. " < " .. M.min_confidence)
+						if callback then
+							callback(nil, nil, nil, false)
+						end
+					elseif callback then
 						callback(response.suggestion, response.range_replace, response.next_suggestion_id, response.should_remove_leading_eol)
 					end
 				else

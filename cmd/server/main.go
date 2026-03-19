@@ -56,6 +56,13 @@ type AdditionalFileInfo struct {
 	StartLineNumberOneIndexed int32    `json:"start_line_number_one_indexed,omitempty"`
 }
 
+// ParameterHintInfo represents an LSP signature help entry from Neovim.
+// Sent when the cursor is inside a function call for better argument suggestions.
+type ParameterHintInfo struct {
+	Label         string  `json:"label"`
+	Documentation *string `json:"documentation,omitempty"`
+}
+
 type NewSuggestionRequest struct {
 	FileContents    string               `json:"file_contents"`
 	Line            int32                `json:"line"`
@@ -69,6 +76,7 @@ type NewSuggestionRequest struct {
 	LineEnding      string               `json:"line_ending,omitempty"`
 	FileVersion     *int32               `json:"file_version,omitempty"`
 	ClientTime      *float64             `json:"client_time,omitempty"`
+	ParameterHints  []ParameterHintInfo  `json:"parameter_hints,omitempty"`
 }
 
 // RecordDiffRequest is sent by the Lua plugin after accepting a suggestion.
@@ -87,6 +95,7 @@ type SuggestionResponse struct {
 	NextSuggestionID       string                     `json:"next_suggestion_id,omitempty"`
 	BindingID              string                     `json:"binding_id,omitempty"`
 	ShouldRemoveLeadingEol bool                       `json:"should_remove_leading_eol,omitempty"`
+	SuggestionConfidence   *int32                     `json:"suggestion_confidence,omitempty"`
 }
 
 // generateSuggestionID creates a unique suggestion ID using UUID
@@ -277,6 +286,21 @@ func handleNewSuggestion(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Populate parameter hints from LSP signature help
+	if len(req.ParameterHints) > 0 {
+		logger.Info("Including parameter hints", "count", len(req.ParameterHints))
+		for _, ph := range req.ParameterHints {
+			hint := &aiserverv1.CppParameterHint{
+				Label: ph.Label,
+			}
+			if ph.Documentation != nil {
+				hint.Documentation = ph.Documentation
+			}
+			streamReq.ParameterHints = append(streamReq.ParameterHints, hint)
+			logger.Debug("Parameter hint", "label", ph.Label)
+		}
+	}
+
 	// Cancel any previous in-flight stream immediately (don't block waiting for it)
 	activeStreamMu.Lock()
 	if activeStreamCancel != nil {
@@ -345,6 +369,7 @@ func handleNewSuggestion(w http.ResponseWriter, r *http.Request) {
 		BindingID:              firstSuggestion.BindingID,
 		ShouldRemoveLeadingEol: firstSuggestion.ShouldRemoveLeadingEol,
 		NextSuggestionID:       firstNextID,
+		SuggestionConfidence:   firstSuggestion.SuggestionConfidence,
 	}
 
 	logAttrs := []any{
@@ -359,6 +384,9 @@ func handleNewSuggestion(w http.ResponseWriter, r *http.Request) {
 	}
 	if firstNextID != "" {
 		logAttrs = append(logAttrs, "next_suggestion_id", firstNextID)
+	}
+	if firstSuggestion.SuggestionConfidence != nil {
+		logAttrs = append(logAttrs, "confidence", *firstSuggestion.SuggestionConfidence)
 	}
 	logger.Info("Returning first suggestion", logAttrs...)
 
@@ -502,6 +530,12 @@ func parseNextSuggestion(stream *connect.ServerStreamForClient[aiserverv1.Stream
 			if resp.ShouldRemoveLeadingEol != nil {
 				currentSuggestion.ShouldRemoveLeadingEol = *resp.ShouldRemoveLeadingEol
 			}
+			// Capture suggestion confidence score
+			if resp.SuggestionConfidence != nil {
+				conf := *resp.SuggestionConfidence
+				currentSuggestion.SuggestionConfidence = &conf
+				logger.Debug("Suggestion confidence received", "confidence", conf)
+			}
 		}
 
 		// Accumulate text
@@ -582,6 +616,7 @@ func handleGetSuggestion(w http.ResponseWriter, r *http.Request) {
 		BindingID:              suggestion.BindingID,
 		ShouldRemoveLeadingEol: suggestion.ShouldRemoveLeadingEol,
 		NextSuggestionID:       suggestion.NextSuggestionID,
+		SuggestionConfidence:   suggestion.SuggestionConfidence,
 	}
 
 	// Delete this suggestion from store (already retrieved)
