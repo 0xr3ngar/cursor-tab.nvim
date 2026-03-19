@@ -88,13 +88,28 @@ function M.setup(opts)
 
 	vim.api.nvim_create_autocmd({ "TextChangedI" }, {
 		callback = function()
-			M.show_suggestion()
+			if not M.is_nes_active then
+				M.show_suggestion()
+			end
+		end,
+	})
+
+	-- Trigger suggestions on normal mode edits (dd, p, x, etc.)
+	vim.api.nvim_create_autocmd({ "TextChanged" }, {
+		callback = function()
+			if not M.is_nes_active and not M.accepting then
+				M.show_suggestion()
+			end
 		end,
 	})
 
 	vim.api.nvim_create_autocmd({ "InsertLeave" }, {
 		callback = function()
-			M.clear_suggestion()
+			-- Clear any inline suggestion when leaving insert mode
+			-- but preserve NES suggestions (they work in normal mode too)
+			if not M.is_nes_active then
+				M.clear_suggestion()
+			end
 		end,
 	})
 
