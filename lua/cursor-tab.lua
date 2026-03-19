@@ -153,6 +153,7 @@ function M.setup(opts)
 		end,
 	})
 
+	-- Insert mode Tab
 	vim.keymap.set("i", "<Tab>", function()
 		if M.accept_suggestion() then
 			return ""
