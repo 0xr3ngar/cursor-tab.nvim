@@ -2,8 +2,10 @@ package cursor
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
+	"time"
 
 	"connectrpc.com/connect"
 	aiserverv1 "github.com/bengu3/cursor-tab.nvim/cursor-api/gen/aiserver/v1"
@@ -46,11 +48,37 @@ func NewClient() (*Client, error) {
 	}, nil
 }
 
+// generateChecksum creates the x-cursor-checksum header value.
+// Matches the Cursor IDE reference implementation.
+func (c *Client) generateChecksum() string {
+	timestamp := uint64(time.Now().UnixNano() / 1e6)
+
+	timestampBytes := []byte{
+		byte(timestamp >> 40),
+		byte(timestamp >> 32),
+		byte(timestamp >> 24),
+		byte(timestamp >> 16),
+		byte(timestamp >> 8),
+		byte(timestamp),
+	}
+
+	// Encrypt bytes using the reference algorithm
+	w := byte(165)
+	for i := 0; i < len(timestampBytes); i++ {
+		timestampBytes[i] = (timestampBytes[i] ^ w) + byte(i%256)
+		w = timestampBytes[i]
+	}
+
+	base64Encoded := base64.StdEncoding.EncodeToString(timestampBytes)
+	return fmt.Sprintf("%s%s", base64Encoded, c.machineID)
+}
+
 func (c *Client) StreamCpp(ctx context.Context, req *aiserverv1.StreamCppRequest) (*connect.ServerStreamForClient[aiserverv1.StreamCppResponse], error) {
 	connectReq := connect.NewRequest(req)
 	connectReq.Header().Set("authorization", "Bearer "+c.accessToken)
 	connectReq.Header().Set("x-cursor-client-version", c.clientVersion)
 	connectReq.Header().Set("x-cursor-machine-id", c.machineID)
+	connectReq.Header().Set("x-cursor-checksum", c.generateChecksum())
 
 	stream, err := c.aiClient.StreamCpp(ctx, connectReq)
 	if err != nil {
