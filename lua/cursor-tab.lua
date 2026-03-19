@@ -412,7 +412,6 @@ function M.display_nes_diff(bufnr, start_line, end_line, new_text_lines)
 end
 
 function M.show_suggestion(suggestion_id, intent)
-	-- Allow showing chained suggestions even while accepting
 	if not M.enabled or (M.accepting and not suggestion_id) then
 		return
 	end
@@ -721,21 +720,27 @@ function M.show_suggestion(suggestion_id, intent)
 end
 
 function M.clear_suggestion()
-	if M.current_suggestion then
+	if M.current_suggestion or M.is_nes_active then
 		vim.api.nvim_buf_clear_namespace(0, M.ns_id, 0, -1)
 		M.current_suggestion = nil
 		M.current_suggestion_text = nil
+		M.current_range_replace = nil
 		M.current_line = nil
 		M.current_col = nil
-M.next_suggestion_id = nil
-M.jump_marker = nil
-M.is_nes_active = false
-M.last_cursor_line = nil
+		M.next_suggestion_id = nil
+		M.is_nes_active = false
 	end
 end
 
 function M.accept_suggestion()
-	if not M.current_suggestion or M.accepting or not M.current_suggestion_text then
+	if M.accepting then
+		return false
+	end
+	-- Accept if we have an active inline suggestion OR an active NES
+	if not M.current_suggestion and not M.is_nes_active then
+		return false
+	end
+	if not M.current_suggestion_text then
 		return false
 	end
 
@@ -744,70 +749,85 @@ function M.accept_suggestion()
 	local suggestion = M.current_suggestion_text
 	local range_replace = M.current_range_replace
 	local next_suggestion_id = M.next_suggestion_id
+	local was_nes = M.is_nes_active
+
+	M.log("accept_suggestion: suggestion=" .. string.sub(suggestion, 1, 80)
+		.. " range=" .. vim.inspect(range_replace)
+		.. " next_id=" .. tostring(next_suggestion_id)
+		.. " is_nes=" .. tostring(was_nes)
+		.. " mode=" .. vim.api.nvim_get_mode().mode)
 
 	M.accepting = true
 	M.clear_suggestion()
 
 	vim.schedule(function()
-		-- Temporarily disable TextChangedI event during text insertion
+		-- Temporarily disable events during text insertion
 		local eventignore_save = vim.o.eventignore
-		vim.o.eventignore = "TextChangedI"
+		vim.o.eventignore = "TextChangedI,TextChanged,CursorMoved,CursorMovedI"
 
-		local lines = vim.split(suggestion, "\n", { plain = true })
+		local bufnr = vim.api.nvim_get_current_buf()
+		local line_count = vim.api.nvim_buf_line_count(bufnr)
+		local new_lines = vim.split(suggestion, "\n", { plain = true })
 
-		-- If we have a range to replace, handle it
 		if range_replace then
 			-- API returns 1-indexed line numbers, convert to 0-indexed
 			local start_line = range_replace.start_line - 1
 			local end_line = range_replace.end_line - 1
 
-			-- Validate range is within bounds
-			local bufnr = vim.api.nvim_get_current_buf()
-			local line_count = vim.api.nvim_buf_line_count(bufnr)
-			local range_out_of_bounds = start_line < 0 or start_line >= line_count
+			M.log("accept: range start_line=" .. start_line .. " end_line=" .. end_line
+				.. " cursor_line=" .. line .. " buf_lines=" .. line_count)
 
-			-- For same-line replacement or out-of-bounds range, use cursor position
-			if (start_line == line and end_line == line) or range_out_of_bounds then
-				-- Strip leading newline if present (like we do for display)
+			-- Validate range is within bounds
+			if start_line < 0 then start_line = 0 end
+			if end_line < 0 then end_line = 0 end
+			if start_line >= line_count then start_line = line_count - 1 end
+			if end_line >= line_count then end_line = line_count - 1 end
+
+			-- Handle special case: start_line > end_line means "insert after end_line"
+			if start_line > end_line then
+				local insert_after = end_line + 1
+				M.log("accept: insert-between-lines at " .. insert_after)
+
+				local clean = suggestion
+				if clean:sub(1, 1) == "\n" then
+					clean = clean:sub(2)
+				end
+				local insert_lines = vim.split(clean, "\n", { plain = true })
+
+				vim.api.nvim_buf_set_lines(bufnr, insert_after, insert_after, false, insert_lines)
+				local final_line = insert_after + #insert_lines - 1
+				vim.api.nvim_win_set_cursor(0, { final_line + 1, #insert_lines[#insert_lines] })
+			else
+				-- Full range replacement: always replace entire lines when range_replace exists
+				-- (covers NES, same-line, and multi-line cases)
+				M.log("accept: full range replacement, lines " .. start_line .. "-" .. end_line)
+
 				local clean_suggestion = suggestion
 				if vim.startswith(clean_suggestion, "\n") then
 					clean_suggestion = string.sub(clean_suggestion, 2)
 				end
+				local replace_lines = vim.split(clean_suggestion, "\n", { plain = true })
 
-				local clean_lines = vim.split(clean_suggestion, "\n", { plain = true })
-
-				-- Replace from beginning of line to cursor with suggestion
-				local line_text = vim.api.nvim_buf_get_lines(0, line, line + 1, false)[1] or ""
-				local after = line_text:sub(col + 1)
-
-				if #clean_lines == 1 then
-					vim.api.nvim_buf_set_text(0, line, 0, line, col, { clean_suggestion })
-					vim.api.nvim_win_set_cursor(0, { line + 1, #clean_suggestion })
-				else
-					clean_lines[#clean_lines] = clean_lines[#clean_lines] .. after
-					vim.api.nvim_buf_set_lines(0, line, line + 1, false, clean_lines)
-					vim.api.nvim_win_set_cursor(0, { line + #clean_lines, #clean_lines[#clean_lines] - #after })
-				end
-			else
-				-- Multi-line replacement: replace entire lines
-				vim.api.nvim_buf_set_lines(0, start_line, end_line + 1, false, lines)
-				vim.api.nvim_win_set_cursor(0, { start_line + #lines, #lines[#lines] })
+				vim.api.nvim_buf_set_lines(bufnr, start_line, end_line + 1, false, replace_lines)
+				local final_line = start_line + #replace_lines - 1
+				vim.api.nvim_win_set_cursor(0, { final_line + 1, #replace_lines[#replace_lines] })
 			end
 		else
 			-- No range to replace, just insert at cursor
+			M.log("accept: no range, inserting at cursor")
 			local line_text = vim.api.nvim_get_current_line()
-			if #lines == 1 then
-				vim.api.nvim_buf_set_text(0, line, col, line, col, { suggestion })
+			if #new_lines == 1 then
+				vim.api.nvim_buf_set_text(bufnr, line, col, line, col, { suggestion })
 				vim.api.nvim_win_set_cursor(0, { line + 1, col + #suggestion })
 			else
 				local before = line_text:sub(1, col)
 				local after = line_text:sub(col + 1)
 
-				lines[1] = before .. lines[1]
-				lines[#lines] = lines[#lines] .. after
+				new_lines[1] = before .. new_lines[1]
+				new_lines[#new_lines] = new_lines[#new_lines] .. after
 
-				vim.api.nvim_buf_set_lines(0, line, line + 1, false, lines)
-				vim.api.nvim_win_set_cursor(0, { line + #lines, #lines[#lines] - #after })
+				vim.api.nvim_buf_set_lines(bufnr, line, line + 1, false, new_lines)
+				vim.api.nvim_win_set_cursor(0, { line + #new_lines, #new_lines[#new_lines] - #after })
 			end
 		end
 
