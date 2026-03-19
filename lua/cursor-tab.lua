@@ -17,8 +17,46 @@ M.enabled = true
 M.pending_job = nil
 M.next_suggestion_id = nil
 
+-- Simple logging function
+function M.log(msg)
+	local f = io.open("/tmp/cursor-tab-debug.log", "a")
+	if f then
+		f:write(os.date("%H:%M:%S") .. " " .. msg .. "\n")
+		f:close()
+	end
+end
+
 function M.setup(opts)
 	opts = opts or {}
+
+	-- Define highlights
+	vim.api.nvim_set_hl(0, "CursorTabJumpMarker", {
+		fg = "#000000",
+		bg = "#50fa7b",
+		bold = true,
+	})
+	vim.api.nvim_set_hl(0, "CursorTabNES", {
+		fg = "#e0ffe0",
+		bg = "#2d4a2d",
+		italic = true,
+	})
+	vim.api.nvim_set_hl(0, "CursorTabNESLine", {
+		bg = "#1a2e1a",
+	})
+	vim.api.nvim_set_hl(0, "CursorTabOldText", {
+		fg = "#ff6b6b",
+		bg = "#2a1a1a",
+		strikethrough = true,
+	})
+	vim.api.nvim_set_hl(0, "CursorTabOldLine", {
+		fg = "#4a4a4a",
+		bg = "#1a1a1a",
+		strikethrough = true,
+	})
+	vim.api.nvim_set_hl(0, "CursorTabGhost", {
+		fg = "#6a737d",
+		italic = true,
+	})
 
 	if not opts.server_path then
 		local installer = require("cursor-tab.installer")
@@ -188,7 +226,7 @@ function M.get_suggestion(suggestion_id, callback)
 
 	if suggestion_id then
 		-- GET existing suggestion from store
-		print("[cursor-tab] get_suggestion called with ID: " .. suggestion_id)
+		M.log("get_suggestion called with ID: " .. suggestion_id)
 		M.pending_job = vim.fn.jobstart({
 			"curl",
 			"-s",
@@ -300,7 +338,7 @@ function M.show_suggestion(suggestion_id)
 
 	-- If suggestion_id provided, get next suggestion immediately without debouncing
 	if suggestion_id then
-		print("[cursor-tab] show_suggestion called with ID: " .. suggestion_id)
+		M.log("show_suggestion called with ID: " .. suggestion_id)
 		M.get_suggestion(suggestion_id, function(suggestion, range_replace, next_suggestion_id, should_remove_leading_eol)
 			if not suggestion then
 				return
@@ -380,7 +418,7 @@ function M.show_suggestion(suggestion_id)
 
 			if #lines > 0 and lines[1] == "" then
 				for i = 2, #lines do
-					table.insert(virt_lines, { { lines[i], "Comment" } })
+					table.insert(virt_lines, { { lines[i], "CursorTabGhost" } })
 				end
 				if #virt_lines > 0 then
 					M.current_suggestion = vim.api.nvim_buf_set_extmark(0, M.ns_id, display_line, display_col, {
@@ -392,12 +430,12 @@ function M.show_suggestion(suggestion_id)
 				for i, text in ipairs(lines) do
 					if i == 1 then
 						M.current_suggestion = vim.api.nvim_buf_set_extmark(0, M.ns_id, display_line, display_col, {
-							virt_text = { { text, "Comment" } },
+							virt_text = { { text, "CursorTabGhost" } },
 							virt_text_pos = "inline",
 							hl_mode = "combine",
 						})
 					else
-						table.insert(virt_lines, { { text, "Comment" } })
+						table.insert(virt_lines, { { text, "CursorTabGhost" } })
 					end
 				end
 				if #virt_lines > 0 then
@@ -522,7 +560,7 @@ function M.show_suggestion(suggestion_id)
 			if #lines > 0 and lines[1] == "" then
 				-- Skip empty first line, show rest as virt_lines
 				for i = 2, #lines do
-					table.insert(virt_lines, { { lines[i], "Comment" } })
+					table.insert(virt_lines, { { lines[i], "CursorTabGhost" } })
 				end
 				if #virt_lines > 0 then
 					M.current_suggestion = vim.api.nvim_buf_set_extmark(0, M.ns_id, display_line, display_col, {
@@ -535,12 +573,12 @@ function M.show_suggestion(suggestion_id)
 				for i, text in ipairs(lines) do
 					if i == 1 then
 						M.current_suggestion = vim.api.nvim_buf_set_extmark(0, M.ns_id, display_line, display_col, {
-							virt_text = { { text, "Comment" } },
+							virt_text = { { text, "CursorTabGhost" } },
 							virt_text_pos = "inline",
 							hl_mode = "combine",
 						})
 					else
-						table.insert(virt_lines, { { text, "Comment" } })
+						table.insert(virt_lines, { { text, "CursorTabGhost" } })
 					end
 				end
 
@@ -651,13 +689,13 @@ function M.accept_suggestion()
 
 		-- If there's a next suggestion, immediately show it
 		if next_suggestion_id then
-			print("[cursor-tab] Scheduling next suggestion: " .. next_suggestion_id)
+			M.log("Scheduling next suggestion: " .. next_suggestion_id)
 			vim.defer_fn(function()
-				print("[cursor-tab] Showing next suggestion: " .. next_suggestion_id)
+				M.log("Showing next suggestion: " .. next_suggestion_id)
 				M.show_suggestion(next_suggestion_id)
 			end, 10)
 		else
-			print("[cursor-tab] No next suggestion, done with chain")
+			M.log("No next suggestion, done with chain")
 			M.accepting = false
 		end
 	end)
