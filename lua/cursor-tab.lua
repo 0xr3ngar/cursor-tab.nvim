@@ -106,6 +106,26 @@ function M.setup(opts)
 		end
 	end, { noremap = true, silent = true, expr = true })
 
+	-- Normal mode Tab for accepting NES suggestions
+	vim.keymap.set("n", "<Tab>", function()
+		if M.accept_suggestion() then
+			return ""
+		else
+			-- Fallback to default Tab behavior
+			return "\t"
+		end
+	end, { noremap = true, silent = true, expr = true })
+
+	-- Escape clears any active suggestion/NES in normal mode
+	vim.keymap.set("n", "<Esc>", function()
+		if M.current_suggestion or M.is_nes_active then
+			M.clear_suggestion()
+			return ""
+		end
+		-- Fallback to default Escape behavior
+		return "<Esc>"
+	end, { noremap = true, silent = true, expr = true })
+
 	vim.api.nvim_create_user_command("CursorTab", function(args)
 		if args.args == "toggle" then
 			M.enabled = not M.enabled
