@@ -231,6 +231,8 @@ func handleNewSuggestion(w http.ResponseWriter, r *http.Request) {
 	activeStreamMu.Lock()
 	if activeStreamCancel != nil {
 		activeStreamCancel()
+		// Clear orphaned suggestions from the canceled stream
+		store.ClearAll()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	activeStreamCancel = cancel
