@@ -29,6 +29,43 @@ function M.log(msg)
 	end
 end
 
+-- Record a suggestion-application diff to the server for file_diff_histories.
+-- This matches the Cursor IDE reference: only tracks diffs from accepted suggestions,
+-- not user edits. Format: "lineNum-|old\nlineNum+|new\n", sliding window of 3.
+function M.record_diff(start_line, old_lines, new_lines)
+	if not M.server_ready or not M.server_url then
+		return
+	end
+
+	local file_path = vim.fn.expand("%:p")
+	local req = {
+		file_path = file_path,
+		start_line = start_line,  -- 0-indexed
+		old_lines = old_lines,
+		new_lines = new_lines,
+	}
+
+	local json_data = vim.fn.json_encode(req)
+	M.log("record_diff: start=" .. start_line .. " old=" .. #old_lines .. " new=" .. #new_lines)
+
+	vim.fn.jobstart({
+		"curl", "-s", "-X", "POST",
+		"-H", "Content-Type: application/json",
+		"-d", json_data,
+		M.server_url .. "/diff/record",
+	}, {
+		on_stdout = function(_, data)
+			if data and #data > 0 then
+				local text = table.concat(data, "")
+				if text ~= "" then
+					M.log("record_diff response: " .. text)
+				end
+			end
+		end,
+		stdout_buffered = true,
+	})
+end
+
 function M.setup(opts)
 	opts = opts or {}
 
@@ -845,6 +882,9 @@ function M.accept_suggestion()
 				end
 				local insert_lines = vim.split(clean, "\n", { plain = true })
 
+				-- Record diff: inserting new lines (no old lines)
+				M.record_diff(insert_after, {}, insert_lines)
+
 				vim.api.nvim_buf_set_lines(bufnr, insert_after, insert_after, false, insert_lines)
 				local final_line = insert_after + #insert_lines - 1
 				vim.api.nvim_win_set_cursor(0, { final_line + 1, #insert_lines[#insert_lines] })
@@ -853,11 +893,17 @@ function M.accept_suggestion()
 				-- (covers NES, same-line, and multi-line cases)
 				M.log("accept: full range replacement, lines " .. start_line .. "-" .. end_line)
 
+				-- Capture old lines BEFORE replacement for diff history
+				local old_lines = vim.api.nvim_buf_get_lines(bufnr, start_line, end_line + 1, false)
+
 				local clean_suggestion = suggestion
 				if vim.startswith(clean_suggestion, "\n") then
 					clean_suggestion = string.sub(clean_suggestion, 2)
 				end
 				local replace_lines = vim.split(clean_suggestion, "\n", { plain = true })
+
+				-- Record diff: old lines -> new lines
+				M.record_diff(start_line, old_lines, replace_lines)
 
 				vim.api.nvim_buf_set_lines(bufnr, start_line, end_line + 1, false, replace_lines)
 				local final_line = start_line + #replace_lines - 1
@@ -868,6 +914,11 @@ function M.accept_suggestion()
 			M.log("accept: no range, inserting at cursor")
 			local line_text = vim.api.nvim_get_current_line()
 			if #new_lines == 1 then
+				-- Record diff: old line -> old line with insertion
+				local old_line_text = line_text
+				local new_line_text = line_text:sub(1, col) .. suggestion .. line_text:sub(col + 1)
+				M.record_diff(line, { old_line_text }, { new_line_text })
+
 				vim.api.nvim_buf_set_text(bufnr, line, col, line, col, { suggestion })
 				vim.api.nvim_win_set_cursor(0, { line + 1, col + #suggestion })
 			else
@@ -876,6 +927,9 @@ function M.accept_suggestion()
 
 				new_lines[1] = before .. new_lines[1]
 				new_lines[#new_lines] = new_lines[#new_lines] .. after
+
+				-- Record diff: old single line -> new multi-line
+				M.record_diff(line, { line_text }, new_lines)
 
 				vim.api.nvim_buf_set_lines(bufnr, line, line + 1, false, new_lines)
 				vim.api.nvim_win_set_cursor(0, { line + #new_lines, #new_lines[#new_lines] - #after })
