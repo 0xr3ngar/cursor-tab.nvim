@@ -11,17 +11,22 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"connectrpc.com/connect"
-	"github.com/google/uuid"
 	aiserverv1 "github.com/bengu3/cursor-tab.nvim/cursor-api/gen/aiserver/v1"
 	"github.com/bengu3/cursor-tab.nvim/internal/cursor"
 	"github.com/bengu3/cursor-tab.nvim/internal/suggestionstore"
+	"github.com/google/uuid"
 )
 
 var cursorClient *cursor.Client
 var store = suggestionstore.NewStore()
 var logger *slog.Logger
+
+// Cancel-and-replace pattern: new requests cancel any in-flight stream
+var activeStreamMu sync.Mutex
+var activeStreamCancel context.CancelFunc
 
 type NewSuggestionRequest struct {
 	FileContents  string `json:"file_contents"`
@@ -30,15 +35,16 @@ type NewSuggestionRequest struct {
 	FilePath      string `json:"file_path"`
 	LanguageID    string `json:"language_id"`
 	WorkspacePath string `json:"workspace_path"`
+	Intent        string `json:"intent,omitempty"`
 }
 
 type SuggestionResponse struct {
-	Suggestion             string                 `json:"suggestion"`
-	Error                  string                 `json:"error,omitempty"`
-	RangeReplace           *suggestionstore.RangeInfo   `json:"range_replace,omitempty"`
-	NextSuggestionID       string                 `json:"next_suggestion_id,omitempty"`
-	BindingID              string                 `json:"binding_id,omitempty"`
-	ShouldRemoveLeadingEol bool                   `json:"should_remove_leading_eol,omitempty"`
+	Suggestion             string                     `json:"suggestion"`
+	Error                  string                     `json:"error,omitempty"`
+	RangeReplace           *suggestionstore.RangeInfo `json:"range_replace,omitempty"`
+	NextSuggestionID       string                     `json:"next_suggestion_id,omitempty"`
+	BindingID              string                     `json:"binding_id,omitempty"`
+	ShouldRemoveLeadingEol bool                       `json:"should_remove_leading_eol,omitempty"`
 }
 
 // generateSuggestionID creates a unique suggestion ID using UUID
@@ -66,6 +72,7 @@ func handleNewSuggestion(w http.ResponseWriter, r *http.Request) {
 		"language_id", req.LanguageID,
 		"workspace_path", req.WorkspacePath,
 		"content_length", len(req.FileContents),
+		"intent", req.Intent,
 	)
 
 	if cursorClient == nil {
@@ -73,13 +80,31 @@ func handleNewSuggestion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Determine intent source for CppIntentInfo
+	// Match Cursor IDE behavior: "typing" (default), "line_changed", "cursor_prediction"
+	intentSource := "typing"
+	switch req.Intent {
+	case "line_changed":
+		intentSource = "line_changed"
+	case "cursor_prediction":
+		intentSource = "cursor_prediction"
+	case "typing", "":
+		intentSource = "typing"
+	default:
+		intentSource = "typing" // Default to typing for unknown intents
+	}
+	logger.Info("Using intent source", "raw_intent", req.Intent, "mapped_source", intentSource)
+
 	lines := strings.Split(req.FileContents, "\n")
 	totalLines := int32(len(lines))
 
 	giveDebug := true
 	supportsCpt := true
 	supportsCrlfCpt := true
+	isDebug := false
+	workspaceID := req.WorkspacePath
 	streamReq := &aiserverv1.StreamCppRequest{
+		WorkspaceId: &workspaceID,
 		CurrentFile: &aiserverv1.CurrentFileInfo{
 			Contents:              req.FileContents,
 			RelativeWorkspacePath: req.FilePath,
@@ -92,21 +117,25 @@ func handleNewSuggestion(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 		CppIntentInfo: &aiserverv1.CppIntentInfo{
-			Source: "typing",
+			Source: intentSource,
 		},
+		IsDebug:         &isDebug,
 		SupportsCpt:     &supportsCpt,
 		SupportsCrlfCpt: &supportsCrlfCpt,
 		GiveDebugOutput: &giveDebug,
 	}
 
-	ctx := r.Context()
+	// Cancel any previous in-flight stream immediately (don't block waiting for it)
+	activeStreamMu.Lock()
+	if activeStreamCancel != nil {
+		activeStreamCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	activeStreamCancel = cancel
+	activeStreamMu.Unlock()
+
 	stream, err := cursorClient.StreamCpp(ctx, streamReq)
 	if err != nil {
-		// Check if request was cancelled
-		if ctx.Err() == context.Canceled {
-			logger.Info("Request cancelled")
-			return
-		}
 		logger.Error("Failed to stream from Cursor API", "error", err)
 		json.NewEncoder(w).Encode(SuggestionResponse{Error: err.Error()})
 		return
