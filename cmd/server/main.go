@@ -529,18 +529,8 @@ func handleGetSuggestion(w http.ResponseWriter, r *http.Request) {
 		"total_suggestions_in_store", len(storeKeysBeforeGet),
 		"store_keys", storeKeysBeforeGet)
 
-	// Get suggestion from store (with brief retry as safety net)
+	// Get suggestion from store (stored synchronously before response, so always present)
 	suggestion := store.Get(suggestionID)
-	if suggestion == nil {
-		for i := 0; i < 6; i++ {
-			time.Sleep(50 * time.Millisecond)
-			suggestion = store.Get(suggestionID)
-			if suggestion != nil {
-				logger.Info("Suggestion found after retry", "suggestion_id", suggestionID, "retries", i+1)
-				break
-			}
-		}
-	}
 	if suggestion == nil {
 		logger.Warn("Suggestion not found in store", "suggestion_id", suggestionID)
 		json.NewEncoder(w).Encode(SuggestionResponse{Error: "suggestion not found"})
@@ -646,6 +636,18 @@ func handleRecordDiff(w http.ResponseWriter, r *http.Request) {
 		history = history[len(history)-3:]
 	}
 	diffHistoryMap[req.FilePath] = history
+
+	// Cap total tracked files at 50 to prevent unbounded growth
+	const maxTrackedFiles = 50
+	if len(diffHistoryMap) > maxTrackedFiles {
+		// Evict a random file (map iteration order is random in Go)
+		for k := range diffHistoryMap {
+			if k != req.FilePath {
+				delete(diffHistoryMap, k)
+				break
+			}
+		}
+	}
 	diffHistoryMu.Unlock()
 
 	logger.Info("Recorded diff for file",
@@ -664,7 +666,7 @@ func main() {
 	flag.Parse()
 
 	// Set up structured logging
-	logFile, err := os.OpenFile("/tmp/cursor-tab.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	logFile, err := os.OpenFile("/tmp/cursor-tab.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open log file: %v\n", err)
 		os.Exit(1)
