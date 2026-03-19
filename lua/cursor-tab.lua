@@ -16,6 +16,9 @@ M.debounce_time_ms = 150
 M.enabled = true
 M.pending_job = nil
 M.next_suggestion_id = nil
+M.jump_marker = nil
+M.is_nes_active = false
+M.last_cursor_line = nil
 
 -- Simple logging function
 function M.log(msg)
@@ -425,114 +428,64 @@ function M.show_suggestion(suggestion_id, intent)
 	if suggestion_id then
 		M.log("show_suggestion called with ID: " .. suggestion_id)
 		M.get_suggestion(suggestion_id, function(suggestion, range_replace, next_suggestion_id, should_remove_leading_eol)
-			if not suggestion then
+			if not suggestion or suggestion == "" then
+				M.log("NES: no suggestion returned for ID " .. suggestion_id)
+				M.accepting = false
 				return
 			end
 
 			-- Strip carriage returns
 			suggestion = suggestion:gsub("\r", "")
 
+			M.log("NES show: suggestion=" .. string.sub(suggestion, 1, 120)
+				.. " range=" .. vim.inspect(range_replace)
+				.. " next_id=" .. tostring(next_suggestion_id))
+
 			-- Store for acceptance
 			M.current_suggestion_text = suggestion
 			M.current_range_replace = range_replace
 			M.next_suggestion_id = next_suggestion_id
+			M.is_nes_active = true
 
-			-- Get current cursor position
-			local cursor = vim.api.nvim_win_get_cursor(0)
-			local line = cursor[1] - 1
-			local col = cursor[2]
-
-			-- Handle special case: start_line > end_line (by exactly 1)
-			local display_suggestion = suggestion
-			local is_special_case = false
-			if range_replace and range_replace.start_line > range_replace.end_line then
-				local diff = range_replace.start_line - range_replace.end_line
-				if diff == 1 then
-					is_special_case = true
-					local actual_line = range_replace.end_line - 1
-					local bufnr = vim.api.nvim_get_current_buf()
-					local current_line_text = vim.api.nvim_buf_get_lines(bufnr, actual_line, actual_line + 1, false)[1] or ""
-					local eol = "\n"
-					local adjusted_suggestion = current_line_text .. eol .. suggestion:sub(2)
-					M.current_suggestion_text = adjusted_suggestion
-					display_suggestion = suggestion
-					range_replace = {
-						start_line = range_replace.end_line,
-						end_line = range_replace.end_line,
-						start_column = 0,
-						end_column = -1,
-					}
-					M.current_range_replace = range_replace
-				end
-			end
-
-			-- Calculate display text and position
-			local display_text = display_suggestion
-			local display_line = line
-			local display_col = col
-
-			if range_replace then
-				local bufnr = vim.api.nvim_get_current_buf()
-				local start_line = range_replace.start_line - 1
-				local end_line = range_replace.end_line - 1
-				local line_count = vim.api.nvim_buf_line_count(bufnr)
-				if start_line >= 0 and start_line < line_count then
-					display_line = start_line
-				end
-				if start_line == end_line and not is_special_case then
-					if vim.startswith(display_text, "\n") then
-						display_text = string.sub(display_text, 2)
-					end
-				end
-			end
-
-			-- Display the suggestion
 			local bufnr = vim.api.nvim_get_current_buf()
 			local line_count = vim.api.nvim_buf_line_count(bufnr)
-			if display_line < 0 or display_line >= line_count then
-				return
+
+			-- Determine where to display based on range_replace
+			local display_line = vim.api.nvim_win_get_cursor(0)[1] - 1
+			local start_line = display_line
+			local end_line = display_line
+
+			if range_replace then
+				start_line = range_replace.start_line - 1
+				end_line = range_replace.end_line - 1
 			end
 
-			local display_line_text = vim.api.nvim_buf_get_lines(bufnr, display_line, display_line + 1, false)[1] or ""
-			if display_col > #display_line_text then
-				display_col = #display_line_text
+			-- Validate bounds
+			if start_line < 0 then start_line = 0 end
+			if end_line < 0 then end_line = 0 end
+			if start_line >= line_count then start_line = line_count - 1 end
+			if end_line >= line_count then end_line = line_count - 1 end
+			display_line = start_line
+
+			-- Strip leading newline for display
+			local display_text = suggestion
+			if vim.startswith(display_text, "\n") then
+				display_text = string.sub(display_text, 2)
 			end
 
 			local lines = vim.split(display_text, "\n", { plain = true })
-			local virt_lines = {}
 
-			if #lines > 0 and lines[1] == "" then
-				for i = 2, #lines do
-					table.insert(virt_lines, { { lines[i], "CursorTabGhost" } })
-				end
-				if #virt_lines > 0 then
-					M.current_suggestion = vim.api.nvim_buf_set_extmark(0, M.ns_id, display_line, display_col, {
-						virt_lines = virt_lines,
-						virt_lines_above = false,
-					})
-				end
-			else
-				for i, text in ipairs(lines) do
-					if i == 1 then
-						M.current_suggestion = vim.api.nvim_buf_set_extmark(0, M.ns_id, display_line, display_col, {
-							virt_text = { { text, "CursorTabGhost" } },
-							virt_text_pos = "inline",
-							hl_mode = "combine",
-						})
-					else
-						table.insert(virt_lines, { { text, "CursorTabGhost" } })
-					end
-				end
-				if #virt_lines > 0 then
-					vim.api.nvim_buf_set_extmark(0, M.ns_id, display_line, display_col, {
-						virt_lines = virt_lines,
-						virt_lines_above = false,
-					})
-				end
-			end
+			-- Use shared NES diff display
+			local display_line = M.display_nes_diff(bufnr, start_line, end_line, lines)
 
 			M.current_line = display_line
-			M.current_col = display_col
+			M.current_col = 0
+
+			-- Move cursor to the target line (for normal mode Tab)
+			vim.api.nvim_win_set_cursor(0, { display_line + 1, 0 })
+
+			M.log("NES display: shown at line=" .. display_line
+				.. " text_lines=" .. #lines)
 
 			-- Done showing next suggestion, allow new suggestions
 			M.accepting = false
@@ -618,7 +571,51 @@ function M.show_suggestion(suggestion_id, intent)
 			M.current_range_replace = range_replace
 			M.next_suggestion_id = next_suggestion_id
 
-			-- If we have a range to replace, calculate what to display
+			-- Check if this should show as NES diff view:
+			-- 1. Targets a different line (remote suggestion)
+			-- 2. We're in normal mode (any suggestion with a range)
+			local is_nes_style = false
+			if range_replace then
+				local start_line = range_replace.start_line - 1
+				if start_line ~= line or mode == "n" then
+					is_nes_style = true
+				end
+			end
+
+			-- Show as NES diff view
+			if is_nes_style then
+				M.is_nes_active = true
+				local line_count = vim.api.nvim_buf_line_count(bufnr)
+				local start_line = range_replace.start_line - 1
+				local end_line = range_replace.end_line - 1
+
+				if start_line < 0 then start_line = 0 end
+				if end_line < 0 then end_line = 0 end
+				if start_line >= line_count then start_line = line_count - 1 end
+				if end_line >= line_count then end_line = line_count - 1 end
+
+				local display_text = suggestion
+				if vim.startswith(display_text, "\n") then
+					display_text = string.sub(display_text, 2)
+				end
+				local new_lines = vim.split(display_text, "\n", { plain = true })
+
+				local display_line = M.display_nes_diff(bufnr, start_line, end_line, new_lines)
+
+				M.current_line = display_line
+				M.current_col = 0
+
+				-- Move cursor to NES target in normal mode so Tab works and
+				-- the clear autocmd doesn't fire immediately due to distance
+				if mode == "n" then
+					vim.api.nvim_win_set_cursor(0, { display_line + 1, 0 })
+					M.log("NES debounce: moved cursor to target line " .. display_line)
+				end
+
+				return
+			end
+
+			-- Standard inline suggestion display
 			local display_text = suggestion
 			local display_line = line
 			local display_col = col
