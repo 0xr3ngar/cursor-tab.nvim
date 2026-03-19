@@ -74,8 +74,15 @@ func (c *Client) generateChecksum() string {
 }
 
 func (c *Client) StreamCpp(ctx context.Context, req *aiserverv1.StreamCppRequest) (*connect.ServerStreamForClient[aiserverv1.StreamCppResponse], error) {
+	// Re-read access token on every call so token refreshes are picked up
+	// without restarting the server. The sqlite query is local and sub-ms.
+	accessToken, err := GetAccessToken()
+	if err != nil {
+		return nil, fmt.Errorf("failed to refresh access token: %w", err)
+	}
+
 	connectReq := connect.NewRequest(req)
-	connectReq.Header().Set("authorization", "Bearer "+c.accessToken)
+	connectReq.Header().Set("authorization", "Bearer "+accessToken)
 	connectReq.Header().Set("x-cursor-client-version", c.clientVersion)
 	connectReq.Header().Set("x-cursor-machine-id", c.machineID)
 	connectReq.Header().Set("x-cursor-checksum", c.generateChecksum())

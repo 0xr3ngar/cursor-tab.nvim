@@ -488,7 +488,7 @@ function M.get_suggestion(suggestion_id, callback, intent)
 			additional_files = additional_files,
 			line_ending = line_ending,
 			file_version = file_version,
-			client_time = os.clock(), -- epoch-style timing
+			client_time = os.time(), -- epoch seconds
 			parameter_hints = parameter_hints,
 		}
 
@@ -992,114 +992,130 @@ function M.accept_suggestion()
 	M.accepting = true
 	M.clear_suggestion()
 
-	vim.schedule(function()
-		-- Temporarily disable events during text insertion
-		local eventignore_save = vim.o.eventignore
-		vim.o.eventignore = "TextChangedI,TextChanged,CursorMoved,CursorMovedI"
-
-		local bufnr = vim.api.nvim_get_current_buf()
-		local line_count = vim.api.nvim_buf_line_count(bufnr)
-		local new_lines = vim.split(suggestion, "\n", { plain = true })
-
-		if range_replace then
-			-- API returns 1-indexed line numbers, convert to 0-indexed
-			local start_line = range_replace.start_line - 1
-			local end_line = range_replace.end_line - 1
-
-			M.log("accept: range start_line=" .. start_line .. " end_line=" .. end_line
-				.. " cursor_line=" .. line .. " buf_lines=" .. line_count)
-
-			-- Validate range is within bounds
-			if start_line < 0 then start_line = 0 end
-			if end_line < 0 then end_line = 0 end
-			if start_line >= line_count then start_line = line_count - 1 end
-			if end_line >= line_count then end_line = line_count - 1 end
-
-			-- Handle special case: start_line > end_line means "insert after end_line"
-			if start_line > end_line then
-				local insert_after = end_line + 1
-				M.log("accept: insert-between-lines at " .. insert_after)
-
-				local clean = suggestion
-				if clean:sub(1, 1) == "\n" then
-					clean = clean:sub(2)
-				end
-				local insert_lines = vim.split(clean, "\n", { plain = true })
-
-				-- Record diff: inserting new lines (no old lines)
-				M.record_diff(insert_after, {}, insert_lines)
-
-				vim.api.nvim_buf_set_lines(bufnr, insert_after, insert_after, false, insert_lines)
-				local final_line = insert_after + #insert_lines - 1
-				vim.api.nvim_win_set_cursor(0, { final_line + 1, #insert_lines[#insert_lines] })
-			else
-				-- Full range replacement: always replace entire lines when range_replace exists
-				-- (covers NES, same-line, and multi-line cases)
-				M.log("accept: full range replacement, lines " .. start_line .. "-" .. end_line)
-
-				-- Capture old lines BEFORE replacement for diff history
-				local old_lines = vim.api.nvim_buf_get_lines(bufnr, start_line, end_line + 1, false)
-
-				local clean_suggestion = suggestion
-				if vim.startswith(clean_suggestion, "\n") then
-					clean_suggestion = string.sub(clean_suggestion, 2)
-				end
-				local replace_lines = vim.split(clean_suggestion, "\n", { plain = true })
-
-				-- Record diff: old lines -> new lines
-				M.record_diff(start_line, old_lines, replace_lines)
-
-				vim.api.nvim_buf_set_lines(bufnr, start_line, end_line + 1, false, replace_lines)
-				local final_line = start_line + #replace_lines - 1
-				vim.api.nvim_win_set_cursor(0, { final_line + 1, #replace_lines[#replace_lines] })
-			end
-		else
-			-- No range to replace, just insert at cursor
-			M.log("accept: no range, inserting at cursor")
-			local line_text = vim.api.nvim_get_current_line()
-			if #new_lines == 1 then
-				-- Record diff: old line -> old line with insertion
-				local old_line_text = line_text
-				local new_line_text = line_text:sub(1, col) .. suggestion .. line_text:sub(col + 1)
-				M.record_diff(line, { old_line_text }, { new_line_text })
-
-				vim.api.nvim_buf_set_text(bufnr, line, col, line, col, { suggestion })
-				vim.api.nvim_win_set_cursor(0, { line + 1, col + #suggestion })
-			else
-				local before = line_text:sub(1, col)
-				local after = line_text:sub(col + 1)
-
-				new_lines[1] = before .. new_lines[1]
-				new_lines[#new_lines] = new_lines[#new_lines] .. after
-
-				-- Record diff: old single line -> new multi-line
-				M.record_diff(line, { line_text }, new_lines)
-
-				vim.api.nvim_buf_set_lines(bufnr, line, line + 1, false, new_lines)
-				vim.api.nvim_win_set_cursor(0, { line + #new_lines, #new_lines[#new_lines] - #after })
-			end
-		end
-
-		-- Restore eventignore
-		vim.o.eventignore = eventignore_save
-
-		-- If there's a next suggestion, immediately show it
-		if next_suggestion_id then
-			M.log("Scheduling next suggestion: " .. next_suggestion_id)
-			vim.defer_fn(function()
-				M.log("Showing next suggestion: " .. next_suggestion_id)
-				M.show_suggestion(next_suggestion_id)
-			end, 10)
-		else
-			M.log("No next suggestion, requesting more from API")
+	-- Safety timeout: if M.accepting is still true after 5s, force-reset it.
+	-- This prevents permanent lockout if an error occurs in the scheduled callback.
+	vim.defer_fn(function()
+		if M.accepting then
+			M.log("accept: safety timeout, force-resetting M.accepting")
 			M.accepting = false
-			-- Auto-request new suggestions to extend the chain seamlessly
-			-- Use "cursor_prediction" intent since we just accepted a suggestion
-			vim.defer_fn(function()
-				if not M.is_nes_active and not M.accepting then
-					M.show_suggestion(nil, "cursor_prediction")
+		end
+	end, 5000)
+
+	vim.schedule(function()
+		local ok, err = pcall(function()
+			-- Temporarily disable events during text insertion
+			local eventignore_save = vim.o.eventignore
+			vim.o.eventignore = "TextChangedI,TextChanged,CursorMoved,CursorMovedI"
+
+			local bufnr = vim.api.nvim_get_current_buf()
+			local line_count = vim.api.nvim_buf_line_count(bufnr)
+			local new_lines = vim.split(suggestion, "\n", { plain = true })
+
+			if range_replace then
+				-- API returns 1-indexed line numbers, convert to 0-indexed
+				local start_line = range_replace.start_line - 1
+				local end_line = range_replace.end_line - 1
+
+				M.log("accept: range start_line=" .. start_line .. " end_line=" .. end_line
+					.. " cursor_line=" .. line .. " buf_lines=" .. line_count)
+
+				-- Validate range is within bounds
+				if start_line < 0 then start_line = 0 end
+				if end_line < 0 then end_line = 0 end
+				if start_line >= line_count then start_line = line_count - 1 end
+				if end_line >= line_count then end_line = line_count - 1 end
+
+				-- Handle special case: start_line > end_line means "insert after end_line"
+				if start_line > end_line then
+					local insert_after = end_line + 1
+					M.log("accept: insert-between-lines at " .. insert_after)
+
+					local clean = suggestion
+					if clean:sub(1, 1) == "\n" then
+						clean = clean:sub(2)
+					end
+					local insert_lines = vim.split(clean, "\n", { plain = true })
+
+					-- Record diff: inserting new lines (no old lines)
+					M.record_diff(insert_after, {}, insert_lines)
+
+					vim.api.nvim_buf_set_lines(bufnr, insert_after, insert_after, false, insert_lines)
+					local final_line = insert_after + #insert_lines - 1
+					vim.api.nvim_win_set_cursor(0, { final_line + 1, #insert_lines[#insert_lines] })
+				else
+					-- Full range replacement: always replace entire lines when range_replace exists
+					-- (covers NES, same-line, and multi-line cases)
+					M.log("accept: full range replacement, lines " .. start_line .. "-" .. end_line)
+
+					-- Capture old lines BEFORE replacement for diff history
+					local old_lines = vim.api.nvim_buf_get_lines(bufnr, start_line, end_line + 1, false)
+
+					local clean_suggestion = suggestion
+					if vim.startswith(clean_suggestion, "\n") then
+						clean_suggestion = string.sub(clean_suggestion, 2)
+					end
+					local replace_lines = vim.split(clean_suggestion, "\n", { plain = true })
+
+					-- Record diff: old lines -> new lines
+					M.record_diff(start_line, old_lines, replace_lines)
+
+					vim.api.nvim_buf_set_lines(bufnr, start_line, end_line + 1, false, replace_lines)
+					local final_line = start_line + #replace_lines - 1
+					vim.api.nvim_win_set_cursor(0, { final_line + 1, #replace_lines[#replace_lines] })
 				end
-			end, 50)
+			else
+				-- No range to replace, just insert at cursor
+				M.log("accept: no range, inserting at cursor")
+				local line_text = vim.api.nvim_get_current_line()
+				if #new_lines == 1 then
+					-- Record diff: old line -> old line with insertion
+					local old_line_text = line_text
+					local new_line_text = line_text:sub(1, col) .. suggestion .. line_text:sub(col + 1)
+					M.record_diff(line, { old_line_text }, { new_line_text })
+
+					vim.api.nvim_buf_set_text(bufnr, line, col, line, col, { suggestion })
+					vim.api.nvim_win_set_cursor(0, { line + 1, col + #suggestion })
+				else
+					local before = line_text:sub(1, col)
+					local after = line_text:sub(col + 1)
+
+					new_lines[1] = before .. new_lines[1]
+					new_lines[#new_lines] = new_lines[#new_lines] .. after
+
+					-- Record diff: old single line -> new multi-line
+					M.record_diff(line, { line_text }, new_lines)
+
+					vim.api.nvim_buf_set_lines(bufnr, line, line + 1, false, new_lines)
+					vim.api.nvim_win_set_cursor(0, { line + #new_lines, #new_lines[#new_lines] - #after })
+				end
+			end
+
+			-- Restore eventignore
+			vim.o.eventignore = eventignore_save
+
+			-- If there's a next suggestion, immediately show it
+			if next_suggestion_id then
+				M.log("Scheduling next suggestion: " .. next_suggestion_id)
+				vim.defer_fn(function()
+					M.log("Showing next suggestion: " .. next_suggestion_id)
+					M.show_suggestion(next_suggestion_id)
+				end, 10)
+			else
+				M.log("No next suggestion, requesting more from API")
+				M.accepting = false
+				-- Auto-request new suggestions to extend the chain seamlessly
+				-- Use "cursor_prediction" intent since we just accepted a suggestion
+				vim.defer_fn(function()
+					if not M.is_nes_active and not M.accepting then
+						M.show_suggestion(nil, "cursor_prediction")
+					end
+				end, 50)
+			end
+		end)
+
+		if not ok then
+			M.accepting = false
+			M.log("accept_suggestion error: " .. tostring(err))
 		end
 	end)
 
