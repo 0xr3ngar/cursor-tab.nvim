@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"connectrpc.com/connect"
 	aiserverv1 "github.com/bengu3/cursor-tab.nvim/cursor-api/gen/aiserver/v1"
@@ -46,15 +47,28 @@ type DiagnosticInfo struct {
 	Source    string `json:"source"`     // e.g. "pyright", "eslint", "lua_ls"
 }
 
+// AdditionalFileInfo represents another open buffer sent from Neovim.
+type AdditionalFileInfo struct {
+	RelativeWorkspacePath     string   `json:"relative_workspace_path"`
+	IsOpen                    bool     `json:"is_open"`
+	VisibleRangeContent       []string `json:"visible_range_content,omitempty"`
+	LastViewedAt              float64  `json:"last_viewed_at,omitempty"`
+	StartLineNumberOneIndexed int32    `json:"start_line_number_one_indexed,omitempty"`
+}
+
 type NewSuggestionRequest struct {
-	FileContents  string           `json:"file_contents"`
-	Line          int32            `json:"line"`
-	Column        int32            `json:"column"`
-	FilePath      string           `json:"file_path"`
-	LanguageID    string           `json:"language_id"`
-	WorkspacePath string           `json:"workspace_path"`
-	Intent        string           `json:"intent,omitempty"`
-	Diagnostics   []DiagnosticInfo `json:"diagnostics,omitempty"`
+	FileContents    string               `json:"file_contents"`
+	Line            int32                `json:"line"`
+	Column          int32                `json:"column"`
+	FilePath        string               `json:"file_path"`
+	LanguageID      string               `json:"language_id"`
+	WorkspacePath   string               `json:"workspace_path"`
+	Intent          string               `json:"intent,omitempty"`
+	Diagnostics     []DiagnosticInfo     `json:"diagnostics,omitempty"`
+	AdditionalFiles []AdditionalFileInfo `json:"additional_files,omitempty"`
+	LineEnding      string               `json:"line_ending,omitempty"`
+	FileVersion     *int32               `json:"file_version,omitempty"`
+	ClientTime      *float64             `json:"client_time,omitempty"`
 }
 
 // RecordDiffRequest is sent by the Lua plugin after accepting a suggestion.
@@ -143,7 +157,12 @@ func handleNewSuggestion(w http.ResponseWriter, r *http.Request) {
 	supportsCpt := true
 	supportsCrlfCpt := true
 	isDebug := false
+	enableMoreContext := true
 	workspaceID := req.WorkspacePath
+	clientTime := float64(time.Now().UnixMilli()) / 1000.0 // epoch seconds as float64
+	if req.ClientTime != nil {
+		clientTime = *req.ClientTime
+	}
 	streamReq := &aiserverv1.StreamCppRequest{
 		WorkspaceId: &workspaceID,
 		CurrentFile: &aiserverv1.CurrentFileInfo{
@@ -166,10 +185,41 @@ func handleNewSuggestion(w http.ResponseWriter, r *http.Request) {
 				DiffHistory: diffHistoryCopy,
 			},
 		},
-		IsDebug:         &isDebug,
-		SupportsCpt:     &supportsCpt,
-		SupportsCrlfCpt: &supportsCrlfCpt,
-		GiveDebugOutput: &giveDebug,
+		IsDebug:           &isDebug,
+		SupportsCpt:       &supportsCpt,
+		SupportsCrlfCpt:   &supportsCrlfCpt,
+		GiveDebugOutput:   &giveDebug,
+		EnableMoreContext: &enableMoreContext,
+		ClientTime:        &clientTime,
+	}
+
+	// Populate file version if provided (monotonic counter per buffer)
+	if req.FileVersion != nil {
+		streamReq.CurrentFile.FileVersion = req.FileVersion
+	}
+
+	// Populate line ending if provided
+	if req.LineEnding != "" {
+		streamReq.CurrentFile.LineEnding = &req.LineEnding
+	}
+
+	// Populate additional files (other open buffers)
+	if len(req.AdditionalFiles) > 0 {
+		logger.Info("Including additional files", "count", len(req.AdditionalFiles))
+		for _, af := range req.AdditionalFiles {
+			protoFile := &aiserverv1.AdditionalFile{
+				RelativeWorkspacePath: af.RelativeWorkspacePath,
+				IsOpen:                af.IsOpen,
+				VisibleRangeContent:   af.VisibleRangeContent,
+			}
+			if af.LastViewedAt > 0 {
+				protoFile.LastViewedAt = &af.LastViewedAt
+			}
+			if af.StartLineNumberOneIndexed > 0 {
+				protoFile.StartLineNumberOneIndexed = []int32{af.StartLineNumberOneIndexed}
+			}
+			streamReq.AdditionalFiles = append(streamReq.AdditionalFiles, protoFile)
+		}
 	}
 
 	// Populate diagnostics from Neovim LSP into both proto fields:
