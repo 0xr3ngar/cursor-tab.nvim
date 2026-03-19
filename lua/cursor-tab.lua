@@ -237,7 +237,7 @@ function M.ensure_server()
 	return true
 end
 
-function M.get_suggestion(suggestion_id, callback)
+function M.get_suggestion(suggestion_id, callback, intent)
 	if not M.ensure_server() then
 		if callback then
 			callback(nil)
@@ -249,7 +249,7 @@ function M.get_suggestion(suggestion_id, callback)
 	if not M.server_ready or not M.server_url then
 		-- Retry after a short delay
 		vim.defer_fn(function()
-			M.get_suggestion(suggestion_id, callback)
+			M.get_suggestion(suggestion_id, callback, intent)
 		end, 50)
 		return
 	end
@@ -312,6 +312,7 @@ function M.get_suggestion(suggestion_id, callback)
 			file_path = vim.fn.expand("%:p"),
 			language_id = vim.bo.filetype,
 			workspace_path = workspace_path,
+			intent = intent or "typing",
 		}
 
 		local json_data = vim.fn.json_encode(req)
@@ -407,7 +408,7 @@ function M.display_nes_diff(bufnr, start_line, end_line, new_text_lines)
 	return display_line
 end
 
-function M.show_suggestion(suggestion_id)
+function M.show_suggestion(suggestion_id, intent)
 	-- Allow showing chained suggestions even while accepting
 	if not M.enabled or (M.accepting and not suggestion_id) then
 		return
@@ -545,29 +546,71 @@ function M.show_suggestion(suggestion_id)
 
 		local line = vim.api.nvim_win_get_cursor(0)[1] - 1
 		local col = vim.api.nvim_win_get_cursor(0)[2]
+		local mode = vim.api.nvim_get_mode().mode
+
+		-- Compute intent source matching Cursor IDE behavior:
+		-- "typing" = default (cursor on same line)
+		-- "line_changed" = cursor moved to different line since last request
+		-- "cursor_prediction" = after accepting a suggestion (passed explicitly)
+		local effective_intent
+		if intent == "cursor_prediction" then
+			effective_intent = "cursor_prediction"
+		elseif M.last_cursor_line ~= nil and M.last_cursor_line ~= line then
+			effective_intent = "line_changed"
+		else
+			effective_intent = "typing"
+		end
+		M.last_cursor_line = line
+
+		M.log("show_suggestion debounce: mode=" .. mode .. " intent=" .. effective_intent)
 
 		M.get_suggestion(nil, function(suggestion, range_replace, next_suggestion_id, should_remove_leading_eol)
-			if not suggestion then
+			if not suggestion or suggestion == "" then
 				return
 			end
 
 			-- Strip carriage returns (Windows line endings)
 			suggestion = suggestion:gsub("\r", "")
 
+			M.log("New suggestion: text=" .. string.sub(suggestion, 1, 80)
+				.. " range=" .. vim.inspect(range_replace)
+				.. " next_id=" .. tostring(next_suggestion_id)
+				.. " mode=" .. mode)
+
 			-- Re-check cursor position and validate it hasn't changed
 			local current_line = vim.api.nvim_win_get_cursor(0)[1] - 1
 			local current_col = vim.api.nvim_win_get_cursor(0)[2]
 
 			-- Validate the position is still valid
-			if current_line ~= line or current_col ~= col then
-				return -- Cursor moved, discard this suggestion
+			-- In normal mode, only check line (col shifts after dd/x/etc.)
+			if mode == "n" then
+				if current_line ~= line then
+					M.log("Position check FAILED (normal): line moved " .. line .. " -> " .. current_line)
+					return
+				end
+				if current_col ~= col then
+					M.log("Position check: col shifted in normal mode " .. col .. " -> " .. current_col .. " (OK, continuing)")
+				end
+			else
+				if current_line ~= line or current_col ~= col then
+					M.log("Position check FAILED (insert): " .. line .. ":" .. col .. " -> " .. current_line .. ":" .. current_col)
+					return -- Cursor moved, discard this suggestion
+				end
 			end
 
-			-- Validate column is within line bounds
+			-- Update col to current value (may have shifted in normal mode after dd/x/etc.)
+			col = current_col
+
+			-- Validate line is within bounds
 			local bufnr = vim.api.nvim_get_current_buf()
 			local line_text = vim.api.nvim_buf_get_lines(bufnr, line, line + 1, false)[1]
-			if not line_text or col > #line_text then
-				return -- Invalid position
+			if not line_text then
+				return
+			end
+
+			-- In normal mode, col check is less strict (cursor can be at end of line)
+			if mode == "i" and col > #line_text then
+				return
 			end
 
 			M.clear_suggestion()
@@ -676,7 +719,7 @@ function M.show_suggestion(suggestion_id)
 
 			M.current_line = display_line
 			M.current_col = display_col
-		end)
+		end, effective_intent)
 	end)
 end
 
