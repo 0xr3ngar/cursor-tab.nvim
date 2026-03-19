@@ -15,6 +15,7 @@ M.debounce_timer = nil
 M.debounce_time_ms = 150
 M.enabled = true
 M.pending_job = nil
+M.request_generation = 0 -- monotonic counter to discard stale curl callbacks
 M.next_suggestion_id = nil
 M.jump_marker = nil
 M.is_nes_active = false
@@ -322,18 +323,34 @@ end
 
 -- Collect LSP signature help (parameter hints) for the current cursor position.
 -- Returns a list of {label=string, documentation=string|nil} or empty table.
+-- Only queries LSP when cursor is likely inside a function call (has unclosed paren).
 function M.get_parameter_hints(bufnr, line, col)
 	local hints = {}
+
+	-- Quick heuristic: only query signature help if current line has an unclosed '('
+	local line_text = vim.api.nvim_buf_get_lines(bufnr, line, line + 1, false)[1] or ""
+	local before_cursor = line_text:sub(1, col + 1)
+	local open = 0
+	for i = 1, #before_cursor do
+		local c = before_cursor:sub(i, i)
+		if c == "(" then open = open + 1
+		elseif c == ")" then open = open - 1
+		end
+	end
+	if open <= 0 then
+		return hints
+	end
+
 	local clients = vim.lsp.get_clients({ bufnr = bufnr })
 	if #clients == 0 then
 		return hints
 	end
 
-	-- Only query clients that support signatureHelp
+	-- Only query the first client that supports signatureHelp (avoid blocking N times)
 	for _, client in ipairs(clients) do
 		if client.server_capabilities.signatureHelpProvider then
 			local params = vim.lsp.util.make_position_params(0, client.offset_encoding)
-			local result = client.request_sync("textDocument/signatureHelp", params, 200, bufnr)
+			local result = client.request_sync("textDocument/signatureHelp", params, 50, bufnr)
 			if result and result.result and result.result.signatures then
 				for _, sig in ipairs(result.result.signatures) do
 					local hint = { label = sig.label }
@@ -347,6 +364,7 @@ function M.get_parameter_hints(bufnr, line, col)
 					table.insert(hints, hint)
 				end
 			end
+			break -- only query one client
 		end
 	end
 	return hints
@@ -374,17 +392,23 @@ function M.get_suggestion(suggestion_id, callback, intent)
 		M.pending_job = nil
 	end
 
+	-- Bump generation so any in-flight callback from a previous request is discarded
+	M.request_generation = M.request_generation + 1
+	local my_generation = M.request_generation
+
 	if suggestion_id then
 		-- GET existing suggestion from store
 		M.log("get_suggestion called with ID: " .. suggestion_id)
 		M.pending_job = vim.fn.jobstart({
 			"curl",
 			"-s",
+			"--max-time", "10",
 			"-X",
 			"GET",
 			M.server_url .. "/suggestion/" .. suggestion_id,
 		}, {
 			on_stdout = function(_, data)
+				if my_generation ~= M.request_generation then return end
 				if not data or #data == 0 then
 					return
 				end
@@ -404,11 +428,11 @@ function M.get_suggestion(suggestion_id, callback, intent)
 						callback(nil, nil, nil, false)
 					end
 				end
-
-				M.pending_job = nil
 			end,
 			on_exit = function()
-				M.pending_job = nil
+				if my_generation == M.request_generation then
+					M.pending_job = nil
+				end
 			end,
 			stdout_buffered = true,
 		})
@@ -497,6 +521,7 @@ function M.get_suggestion(suggestion_id, callback, intent)
 		M.pending_job = vim.fn.jobstart({
 			"curl",
 			"-s",
+			"--max-time", "10",
 			"-X",
 			"POST",
 			"-H",
@@ -506,6 +531,7 @@ function M.get_suggestion(suggestion_id, callback, intent)
 			M.server_url .. "/suggestion/new",
 		}, {
 			on_stdout = function(_, data)
+				if my_generation ~= M.request_generation then return end
 				if not data or #data == 0 then
 					return
 				end
@@ -532,11 +558,11 @@ function M.get_suggestion(suggestion_id, callback, intent)
 						callback(nil, nil, nil, false)
 					end
 				end
-
-				M.pending_job = nil
 			end,
 			on_exit = function()
-				M.pending_job = nil
+				if my_generation == M.request_generation then
+					M.pending_job = nil
+				end
 			end,
 			stdout_buffered = true,
 		})

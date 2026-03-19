@@ -679,6 +679,9 @@ func main() {
 	cursorClient, err = cursor.NewClient()
 	if err != nil {
 		logger.Error("Failed to initialize Cursor client", "error", err)
+		// Write to stderr so the Lua on_stderr handler can show it to the user
+		fmt.Fprintf(os.Stderr, "cursor-tab: auth failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "cursor-tab: make sure Cursor IDE is installed and you are signed in\n")
 	}
 
 	// POST /suggestion/new - generate new suggestions from Cursor

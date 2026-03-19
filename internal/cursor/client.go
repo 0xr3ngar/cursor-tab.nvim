@@ -37,7 +37,9 @@ func NewClient() (*Client, error) {
 		return nil, fmt.Errorf("failed to get Cursor version: %w", err)
 	}
 
-	httpClient := &http.Client{}
+	httpClient := &http.Client{
+		Timeout: 30 * time.Second,
+	}
 	aiClient := aiserverv1connect.NewAiServiceClient(httpClient, APIBaseURL)
 
 	return &Client{
